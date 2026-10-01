@@ -409,8 +409,10 @@ where
                 params,
                 context,
                 qconn,
+                pending_handshake,
             } = pre_running;
-            let running_worker = IoWorker::new(params, RunningApplication);
+            let running_worker =
+                IoWorker::new(params, RunningApplication { pending_handshake });
 
             let Closing {
                 params,

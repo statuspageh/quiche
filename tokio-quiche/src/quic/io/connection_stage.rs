@@ -92,21 +92,16 @@ pub struct Handshake {
     pub handshake_info: HandshakeInfo,
 }
 
-impl Handshake {
-    fn check_handshake_timeout_expired(
-        &self, conn: &mut QuicheConnection,
-    ) -> QuicResult<()> {
-        if self.handshake_info.is_expired() {
-            let _ = conn.close(
-                false,
-                quiche::WireErrorCode::ApplicationError as u64,
-                &[],
-            );
-            return Err(HandshakeError::Timeout.into());
-        }
-
-        Ok(())
+fn check_handshake_timeout_expired(
+    handshake_info: &HandshakeInfo, conn: &mut QuicheConnection,
+) -> QuicResult<()> {
+    if handshake_info.is_expired() {
+        let err = quiche::WireErrorCode::ApplicationError as u64;
+        let _ = conn.close(false, err, &[]);
+        return Err(HandshakeError::Timeout.into());
     }
+
+    Ok(())
 }
 
 impl ConnectionStage for Handshake {
@@ -130,7 +125,7 @@ impl ConnectionStage for Handshake {
     fn post_wait(
         &self, qconn: &mut QuicheConnection,
     ) -> ControlFlow<QuicResult<()>> {
-        match self.check_handshake_timeout_expired(qconn) {
+        match check_handshake_timeout_expired(&self.handshake_info, qconn) {
             Ok(_) => ControlFlow::Continue(()),
             Err(e) => ControlFlow::Break(Err(e)),
         }
@@ -138,13 +133,41 @@ impl ConnectionStage for Handshake {
 }
 
 #[derive(Debug)]
-pub struct RunningApplication;
+pub struct RunningApplication {
+    /// Set when the application was started with 0-RTT early data, before the
+    /// handshake completed. The handshake timeout keeps being enforced until
+    /// the handshake completes, as otherwise a client that never completes
+    /// it could keep the connection in early data indefinitely.
+    pub pending_handshake: Option<HandshakeInfo>,
+}
+
+impl RunningApplication {
+    fn check_pending_handshake(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> QuicResult<()> {
+        let Some(handshake_info) = &self.pending_handshake else {
+            return Ok(());
+        };
+
+        if qconn.is_established() {
+            self.pending_handshake = None;
+            return Ok(());
+        }
+
+        check_handshake_timeout_expired(handshake_info, qconn)
+    }
+}
 
 impl ConnectionStage for RunningApplication {
     fn on_read<A: ApplicationOverQuic>(
         &mut self, received_packets: bool, qconn: &mut QuicheConnection,
         ctx: &mut ConnectionStageContext<A>,
     ) -> QuicResult<()> {
+        // This is checked before handing any data to the application, and on
+        // every iteration of the work loop, so that a peer flooding 0-RTT
+        // packets can't keep the worker busy past the deadline.
+        self.check_pending_handshake(qconn)?;
+
         if ctx.application.should_act() {
             if received_packets {
                 ctx.application.process_reads(qconn)?;
@@ -156,6 +179,12 @@ impl ConnectionStage for RunningApplication {
         }
 
         Ok(())
+    }
+
+    fn wait_deadline(&mut self) -> Option<Instant> {
+        self.pending_handshake
+            .as_ref()
+            .and_then(HandshakeInfo::deadline)
     }
 }
 

@@ -45,6 +45,7 @@ use crate::metrics::labels;
 use crate::metrics::Metrics;
 use crate::quic::connection::ApplicationOverQuic;
 use crate::quic::connection::HandshakeError;
+use crate::quic::connection::HandshakeInfo;
 use crate::quic::connection::Incoming;
 use crate::quic::connection::QuicConnectionStats;
 use crate::quic::connection::SharedConnectionIdGenerator;
@@ -1023,6 +1024,8 @@ pub struct Running<Tx, M, A> {
     pub(crate) context: ConnectionStageContext<A>,
     /// See [`QuicConnectionParams::quiche_conn`].
     pub(crate) qconn: Box<QuicheConnection>,
+    /// See [`RunningApplication::pending_handshake`].
+    pub(crate) pending_handshake: Option<HandshakeInfo>,
 }
 
 impl<Tx, M, A> Running<Tx, M, A> {
@@ -1096,11 +1099,18 @@ where
             self.on_conn_established(&mut qconn, &mut ctx.application);
         notify_path_events(ctx.connection_hook.as_deref(), &mut qconn);
 
+        // The application may be started with 0-RTT early data, before the
+        // handshake completes, in which case the handshake timeout must still
+        // be enforced.
+        let pending_handshake = (!qconn.is_established())
+            .then(|| self.conn_stage.handshake_info.clone());
+
         match on_conn_established_result {
             Ok(()) => RunningOrClosing::Running(Running {
                 params: self.into(),
                 context: ctx,
                 qconn,
+                pending_handshake,
             }),
             Err(e) => {
                 foundations::telemetry::log::warn!(
@@ -1171,19 +1181,26 @@ where
         // unconditionally, to ensure that any application data (e.g.
         // STREAM frames or datagrams) processed by the Handshake
         // stage are properly passed to the application.
-        let on_read_result = self.conn_stage.on_read(true, &mut qconn, &mut ctx);
+        let mut work_loop_result =
+            self.conn_stage.on_read(true, &mut qconn, &mut ctx);
         notify_path_events(ctx.connection_hook.as_deref(), &mut qconn);
-        if let Err(e) = on_read_result {
-            return Closing {
-                params: self.into(),
-                context: ctx,
-                work_loop_result: Err(e),
-                qconn,
-            };
-        };
 
-        let work_loop_result = self.work_loop(&mut qconn, &mut ctx).await;
-        notify_path_events(ctx.connection_hook.as_deref(), &mut qconn);
+        if work_loop_result.is_ok() {
+            work_loop_result = self.work_loop(&mut qconn, &mut ctx).await;
+            notify_path_events(ctx.connection_hook.as_deref(), &mut qconn);
+        }
+
+        // A connection started with 0-RTT early data that ends before the
+        // handshake completes is a failed handshake, as in the Handshake stage.
+        if self.conn_stage.pending_handshake.is_some() && !qconn.is_established()
+        {
+            let reason = match &work_loop_result {
+                Err(err) => err.into(),
+                Ok(()) => labels::HandshakeError::Disconnect,
+            };
+
+            self.metrics.failed_handshakes(reason).inc();
+        }
 
         Closing {
             params: self.into(),
